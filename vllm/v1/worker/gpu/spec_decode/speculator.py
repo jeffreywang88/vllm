@@ -152,7 +152,7 @@ class DraftModelSpeculator(BaseSpeculator):
             device=device,
         )
         self.idx_mapping = torch.zeros(
-            self.max_num_reqs, dtype=torch.int32, device=device
+            self.max_num_reqs, dtype=torch.int64, device=device
         )
         self.temperature = torch.zeros(
             self.max_num_reqs, dtype=torch.float32, device=device
@@ -562,3 +562,19 @@ class DraftModelSpeculator(BaseSpeculator):
             causal=causal,
             dcp_local_seq_lens=dcp_local_seq_lens,
         )
+
+    def _update_draft_decode_metadata(
+        self, attn_metadata: dict[str, Any], num_reqs: int
+    ) -> None:
+        if self.block_tables.cp_size > 1:
+            prepare_dcp_local_seq_lens(
+                self.input_buffers.dcp_local_seq_lens,
+                self.input_buffers.seq_lens,
+                num_reqs,
+                self.block_tables.cp_size,
+                self.block_tables.cp_rank,
+                self.block_tables.cp_interleave,
+            )
+        for groups in self.attn_groups:
+            for group in groups:
+                group.update_draft_decode_metadata(attn_metadata)
