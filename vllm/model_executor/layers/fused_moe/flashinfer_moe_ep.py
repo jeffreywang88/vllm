@@ -30,7 +30,7 @@ from vllm.model_executor.layers.quantization.utils.quant_utils import (
 )
 from vllm.platforms import current_platform
 from vllm.utils.deep_gemm import _import_deep_gemm
-from vllm.utils.math_utils import cdiv
+from vllm.utils.math_utils import cdiv, round_up_to
 
 if TYPE_CHECKING:
     from vllm.model_executor.layers.fused_moe.config import FusedMoEConfig
@@ -245,6 +245,10 @@ def mxfp4_moe_ep_weights(
     )
 
 
+# Smaller decode workspaces save under 3 us per layer but still cost memory.
+MIN_DECODE_WORKSPACE_TOKENS = 64
+
+
 class _FlashInferMoeEpApi:
     def __init__(self) -> None:
         try:
@@ -383,8 +387,8 @@ class FlashInferMoeEp:
         self._epilogue: FlashInferMoeEpEpilogue | None = epilogue
         self._return_workspace_view = moe.routing_method is RoutingMethodType.DeepseekV4
         self._sp_size = moe.sp_size
-        self._decode_max_num_tokens = 0
-        self._decode_workspace: Any | None = None
+        self._decode_capacities: list[int] = []
+        self._decode_workspaces: dict[int, Any] = {}
         self._is_separate_workspace_supported = (
             spec.kernel == "cutedsl"
             and moe.moe_parallel_config.pcp_size == 1
@@ -397,8 +401,16 @@ class FlashInferMoeEp:
                 * (1 + vllm_config.num_speculative_tokens),
                 self._sp_size,
             )
-            if decode_tokens < self._max_num_tokens:
-                self._decode_max_num_tokens = decode_tokens
+            capacities: list[int] = []
+            if moe.moe_parallel_config.dp_size > 1:
+                size = MIN_DECODE_WORKSPACE_TOKENS
+                while size < decode_tokens:
+                    capacities.append(size)
+                    size *= 2
+            capacities.append(decode_tokens)
+            self._decode_capacities = [
+                size for size in capacities if size < self._max_num_tokens
+            ]
 
     @property
     def can_overlap_shared_experts(self) -> bool:
@@ -430,13 +442,12 @@ class FlashInferMoeEp:
             max_tokens = cdiv(
                 int(metadata.num_tokens_across_dp_cpu.max().item()), self._sp_size
             )
-        if (
-            self._decode_workspace is not None
-            and max_tokens <= self._decode_max_num_tokens
-        ):
-            assert num_tokens <= self._decode_max_num_tokens
-            return self._decode_workspace
-        return None
+        # Kernel time grows with workspace size, so use the smallest that fits.
+        capacity = round_up_to(self._decode_capacities, max_tokens)
+        if capacity is None or capacity not in self._decode_workspaces:
+            return None
+        assert num_tokens <= capacity
+        return self._decode_workspaces[capacity]
 
     def _tensors(
         self,
@@ -510,12 +521,13 @@ class FlashInferMoeEp:
         )
         tensors = self._tensors(hidden_states, topk_ids, topk_weights)
         self._mega_layer.warmup(tensors)
-        if self._is_separate_workspace_supported and self._decode_max_num_tokens:
-            if self._decode_workspace is None:
-                self._decode_workspace = self._mega_layer.create_workspace(
-                    self._decode_max_num_tokens
-                )
-            self._mega_layer.warmup(tensors, workspace=self._decode_workspace)
+        # Collective: every rank creates the same workspaces in the same order.
+        for capacity in self._decode_capacities:
+            workspace = self._decode_workspaces.get(capacity)
+            if workspace is None:
+                workspace = self._mega_layer.create_workspace(capacity)
+                self._decode_workspaces[capacity] = workspace
+            self._mega_layer.warmup(tensors, workspace=workspace)
 
     def kernel_weights(
         self,
@@ -547,7 +559,7 @@ class FlashInferMoeEp:
             return
         mega_layer.destroy()
         self._mega_layer = None
-        self._decode_workspace = None
+        self._decode_workspaces = {}
         self._epilogue = None
 
     def __del__(self) -> None:

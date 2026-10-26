@@ -344,7 +344,7 @@ def _data_parallel_boundary_forward(env: dict[str, str], world_size: int) -> Non
         adapter = FlashInferMoeEp(moe, weights, apply_topk_in_fc1=False)
         try:
             adapter.warmup()
-            assert adapter._decode_max_num_tokens == 32
+            assert list(adapter._decode_workspaces) == [32]
             quant_config = FusedMoEQuantConfig.make()
             experts = FlashInferMoeEpExperts(moe, quant_config)
             experts._adapter = adapter
@@ -447,6 +447,114 @@ def test_data_parallel_boundary_preserves_local_tokens_and_graphs():
     if torch.accelerator.device_count() < 2:
         pytest.skip("Need at least 2 GPUs")
     distributed_run(_data_parallel_boundary_forward, 2)
+
+
+@torch.inference_mode()
+def _decode_workspaces_forward(env: dict[str, str], world_size: int) -> None:
+    """Check that each decode step uses the smallest workspace that fits.
+
+    Warmup should create workspaces for 64, 128, 256 and 384 tokens. Each step
+    should pick the smallest one that fits the busiest rank and give exact
+    results. A CUDA graph keeps the workspace it was captured with, so graphs
+    captured at different batch sizes should also give exact results when
+    replayed one after another.
+    """
+    from dataclasses import replace
+
+    from vllm.distributed import graph_capture
+    from vllm.forward_context import set_forward_context
+
+    set_env_vars_and_device(env)
+    rank = torch.distributed.get_rank()
+    vllm_config = VllmConfig(
+        parallel_config=ParallelConfig(
+            data_parallel_size=world_size,
+            data_parallel_rank=rank,
+            enable_expert_parallel=True,
+        ),
+        kernel_config=KernelConfig(moe_backend=FLASHINFER_MOE_EP_CUTEDSL),
+    )
+    vllm_config.scheduler_config.max_num_seqs = 384
+    geometry = Geometry("dp-top8", 1024, 512, 32, 8)
+    with set_current_vllm_config(vllm_config):
+        ensure_model_parallel_initialized(
+            tensor_model_parallel_size=1, pipeline_model_parallel_size=1
+        )
+        device = torch.device(f"cuda:{rank}")
+        moe = _moe_config(
+            vllm_config, geometry, world_size, device, FLASHINFER_MOE_EP_CUTEDSL
+        )
+        moe = replace(moe, max_num_tokens=2048)
+        weights = _local_expert_weights(geometry, rank, moe.num_local_experts, device)
+        adapter = FlashInferMoeEp(moe, weights, apply_topk_in_fc1=False)
+        try:
+            adapter.warmup()
+            assert list(adapter._decode_workspaces) == [64, 128, 256, 384]
+            ids, scores = _routing(geometry, rank, device)
+            x = _hidden_states(geometry, device)
+            expected = _expected_output(geometry, ids, scores)
+
+            def run(inputs, sizes):
+                with set_forward_context(
+                    None,
+                    vllm_config,
+                    num_tokens=inputs[0].shape[0],
+                    num_tokens_across_dp=torch.tensor(sizes, dtype=torch.int32),
+                ):
+                    workspace = adapter._select_workspace(inputs[0].shape[0])
+                    return workspace, adapter(*inputs)
+
+            graphs = []
+            for sizes, capacity in (
+                ((5, 0), 64),
+                ((1, 65), 128),
+                ((300, 2), 384),
+                ((384, 384), 384),
+                ((385, 0), None),
+            ):
+                rows = torch.arange(sizes[rank], device=device) % NUM_TOKENS_PER_RANK
+                inputs = (x[rows], ids[rows], scores[rows])
+                workspace, output = run(inputs, sizes)
+                if capacity is None:
+                    assert workspace is None
+                else:
+                    assert workspace is adapter._decode_workspaces[capacity]
+                assert torch.equal(output, expected[rows])
+                if capacity in (64, 384):
+                    graph = torch.cuda.CUDAGraph()
+                    with (
+                        graph_capture(device) as capture,
+                        torch.cuda.graph(graph, stream=capture.stream),
+                    ):
+                        captured = run(inputs, sizes)[1]
+                    graphs.append((graph, inputs, captured, rows))
+
+            for graph, inputs, captured, rows in (*graphs, graphs[0]):
+                rows = (rows + 1) % NUM_TOKENS_PER_RANK
+                for buffer, value in zip(inputs, (x[rows], ids[rows], scores[rows])):
+                    buffer.copy_(value)
+                graph.replay()
+                assert torch.equal(captured, expected[rows])
+            for graph, *_ in graphs:
+                graph.reset()
+        finally:
+            adapter.destroy()
+
+
+@pytest.mark.skipif(
+    not current_platform.is_device_capability_family(100),
+    reason="The FlashInfer MoE-EP megakernels require SM100",
+)
+def test_decode_workspace_selection():
+    """DP2 decode runs in the smallest workspace that fits the largest rank's
+    batch, with exact outputs, also when graphs bound to different workspaces
+    are replayed in turn."""
+    moe_ep = pytest.importorskip("flashinfer.moe_ep")
+    if not hasattr(moe_ep.MoEEpMegaLayer, "create_workspace"):
+        pytest.skip("FlashInfer does not support multiple MegaMoE workspaces")
+    if torch.accelerator.device_count() < 2:
+        pytest.skip("Need at least 2 GPUs")
+    distributed_run(_decode_workspaces_forward, 2)
 
 
 @pytest.mark.skipif(
