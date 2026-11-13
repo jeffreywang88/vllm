@@ -743,6 +743,9 @@ class CompletionResponseStreamChoice(OpenAIBaseModel):
     token_ids: list[int] | None = None
     # Set on the final chunk only; covers the whole output.
     weight_versions: list[WeightVersionSpan] | None = None
+    # Tokens generated for this choice since its previous chunk. One chunk can
+    # carry several tokens when the frontend falls behind the engine.
+    num_tokens: int | None = None
 
 
 class CompletionStreamResponse(OpenAIBaseModel):

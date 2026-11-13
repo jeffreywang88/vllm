@@ -16,7 +16,9 @@ from vllm.entrypoints.openai.completion.serving import _delta_frame_template
 CREATED = 1706000000
 
 
-def model_frame(request_id: str, model_name: str, index: int, text: str) -> str:
+def model_frame(
+    request_id: str, model_name: str, index: int, text: str, num_tokens: int
+) -> str:
     chunk = CompletionStreamResponse(
         id=request_id,
         object="text_completion",
@@ -32,6 +34,7 @@ def model_frame(request_id: str, model_name: str, index: int, text: str) -> str:
                 prompt_token_ids=None,
                 token_ids=None,
                 weight_versions=None,
+                num_tokens=num_tokens,
             )
         ],
         kv_transfer_params=None,
@@ -50,6 +53,7 @@ def model_frame(request_id: str, model_name: str, index: int, text: str) -> str:
         "unicode é 日本語 🚀 \U0001d549\U0010ffff",
     ],
 )
+@pytest.mark.parametrize("num_tokens", [0, 1, 53])
 @pytest.mark.parametrize(
     ("request_id", "model_name", "index"),
     [
@@ -58,13 +62,14 @@ def model_frame(request_id: str, model_name: str, index: int, text: str) -> str:
     ],
 )
 def test_template_frame_matches_model_frame(
-    request_id: str, model_name: str, index: int, text: str
+    request_id: str, model_name: str, index: int, text: str, num_tokens: int
 ):
     template = _delta_frame_template(request_id, CREATED, model_name)
     assert template is not None
-    prefix, infix, suffix = template
-    frame = f"{prefix}{index}{infix}{json.dumps(text, ensure_ascii=False)}{suffix}"
-    assert frame == model_frame(request_id, model_name, index, text)
+    prefix, infix, middle, suffix = template
+    encoded = json.dumps(text, ensure_ascii=False)
+    frame = f"{prefix}{index}{infix}{encoded}{middle}{num_tokens}{suffix}"
+    assert frame == model_frame(request_id, model_name, index, text, num_tokens)
 
 
 def test_template_is_none_when_sentinels_are_ambiguous():

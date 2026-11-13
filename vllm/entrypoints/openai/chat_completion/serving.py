@@ -548,6 +548,8 @@ class OpenAIServingChat(GenerateBaseServing):
         num_cache_creation_tokens = None
 
         previous_texts = [""] * num_choices
+        # Output tokens already reported per choice in `num_tokens`.
+        reported_tokens = [0] * num_choices
 
         try:
             if self.parser_cls is not None:
@@ -617,6 +619,7 @@ class OpenAIServingChat(GenerateBaseServing):
                             ),
                             logprobs=None,
                             finish_reason=None,
+                            num_tokens=0,
                         )
 
                         # return prompt_token_ids at the first chunk ever
@@ -668,6 +671,7 @@ class OpenAIServingChat(GenerateBaseServing):
                                     delta=DeltaMessage(content=last_msg_content),
                                     logprobs=None,
                                     finish_reason=None,
+                                    num_tokens=0,
                                 )
                                 chunk = ChatCompletionStreamResponse(
                                     id=request_id,
@@ -793,6 +797,10 @@ class OpenAIServingChat(GenerateBaseServing):
                     include_token_ids = (
                         request.return_token_ids and not hide_stream_metadata
                     )
+                    # Tokens a parser withheld since the last emitted chunk
+                    # count toward this one.
+                    num_tokens = processor.num_output_tokens - reported_tokens[i]
+                    reported_tokens[i] = processor.num_output_tokens
 
                     if output.finish_reason is None:
                         # Send token-by-token response for each request.n
@@ -804,6 +812,7 @@ class OpenAIServingChat(GenerateBaseServing):
                             token_ids=(
                                 as_list(output.token_ids) if include_token_ids else None
                             ),
+                            num_tokens=num_tokens,
                         )
 
                     # if the model is finished generating
@@ -823,6 +832,7 @@ class OpenAIServingChat(GenerateBaseServing):
                                 if request.return_weight_versions
                                 else None
                             ),
+                            num_tokens=num_tokens,
                         )
 
                         finish_reason_sent[i] = True
